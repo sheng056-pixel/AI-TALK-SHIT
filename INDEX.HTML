@@ -1,0 +1,513 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>AI-TALK-SHIT | 對立立場對話生成器</title>
+  <!-- 載入 Tailwind CSS -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <!-- 載入 React 與 Babel -->
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+</head>
+<body class="bg-slate-900 text-slate-100 min-h-screen font-sans">
+  <div id="root"></div>
+
+  <script type="text/babel">
+    const { useState, useEffect } = React;
+
+    const PRESET_PAIRS = [
+      { a: '老公', b: '老婆' },
+      { a: '老闆', b: '員工' },
+      { a: '老師', b: '學生' },
+      { a: '甲方業主', b: '乙方包商' },
+      { a: '資深前輩', b: '菜鳥新人' }
+    ];
+
+    const DEFAULT_BARS = [
+      { id: 'tone', left: '溫和', right: '嚴重偏激', value: 50 },
+      { id: 'stance', left: '良善的', right: '嚴重對立的', value: 70 },
+      { id: 'style', left: '理性溝通', right: '諷刺的', value: 60 },
+      { id: 'fact', left: '胡言亂語', right: '本於事實', value: 50, isFactBar: true }
+    ];
+
+    function App() {
+      const [apiKey, setApiKey] = useState(() => localStorage.getItem('gemini_api_key') || '');
+      const [showKeyInput, setShowKeyInput] = useState(!localStorage.getItem('gemini_api_key'));
+
+      const [roleA, setRoleA] = useState('老闆');
+      const [roleB, setRoleB] = useState('員工');
+      const [barsA, setBarsA] = useState(JSON.parse(JSON.stringify(DEFAULT_BARS)));
+      const [barsB, setBarsB] = useState(JSON.parse(JSON.stringify(DEFAULT_BARS)));
+
+      const [messages, setMessages] = useState([
+        {
+          id: 1,
+          speaker: 'A',
+          text: '現在年輕人真的很不能吃苦，下班時間一到就準時走，公司是給你來養老的嗎？',
+          image: null,
+          sources: []
+        }
+      ]);
+
+      const [isGenerating, setIsGenerating] = useState(false);
+      const [errorMsg, setErrorMsg] = useState('');
+      const [newBarLeft, setNewBarLeft] = useState('');
+      const [newBarRight, setNewBarRight] = useState('');
+
+      const saveApiKey = (val) => {
+        setApiKey(val);
+        localStorage.setItem('gemini_api_key', val);
+      };
+
+      const handleBarChange = (side, id, newVal) => {
+        const setter = side === 'A' ? setBarsA : setBarsB;
+        setter(prev => prev.map(b => b.id === id ? { ...b, value: Number(newVal) } : b));
+      };
+
+      const addCustomBar = () => {
+        if (!newBarLeft.trim() || !newBarRight.trim()) return;
+        const newId = 'custom_' + Date.now();
+        const newBar = { id: newId, left: newBarLeft.trim(), right: newBarRight.trim(), value: 50 };
+        setBarsA(prev => [...prev, { ...newBar }]);
+        setBarsB(prev => [...prev, { ...newBar }]);
+        setNewBarLeft('');
+        setNewBarRight('');
+      };
+
+      const handleMessageChange = (id, newText) => {
+        setMessages(prev => prev.map(m => m.id === id ? { ...m, text: newText } : m));
+      };
+
+      // 處理 Ctrl+V 貼上圖片
+      const handlePasteImage = (e, msgId) => {
+        const items = e.clipboardData?.items;
+        if (!items) return;
+        for (let i = 0; i < items.length; i++) {
+          if (items[i].type.indexOf('image') !== -1) {
+            e.preventDefault();
+            const blob = items[i].getAsFile();
+            const reader = new FileReader();
+            reader.onload = (event) => {
+              const base64 = event.target.result;
+              setMessages(prev => prev.map(m => m.id === msgId ? { ...m, image: base64 } : m));
+            };
+            reader.readAsDataURL(blob);
+            break;
+          }
+        }
+      };
+
+      const removeImage = (msgId) => {
+        setMessages(prev => prev.map(m => m.id === msgId ? { ...m, image: null } : m));
+      };
+
+      const addManualMessage = (speaker) => {
+        setMessages(prev => [
+          ...prev,
+          { id: Date.now(), speaker, text: '', image: null, sources: [] }
+        ]);
+      };
+
+      const deleteMessage = (id) => {
+        setMessages(prev => prev.filter(m => m.id !== id));
+      };
+
+      const generateNextTurn = async (forceSpeaker = null) => {
+        if (!apiKey.trim()) {
+          setErrorMsg('請先在最上方輸入您的 Gemini API Key！');
+          setShowKeyInput(true);
+          return;
+        }
+        setErrorMsg('');
+        setIsGenerating(true);
+
+        try {
+          const lastMsg = messages[messages.length - 1];
+          const nextSpeaker = forceSpeaker || (lastMsg ? (lastMsg.speaker === 'A' ? 'B' : 'A') : 'B');
+          const myRole = nextSpeaker === 'A' ? roleA : roleB;
+          const oppRole = nextSpeaker === 'A' ? roleB : roleA;
+          const myBars = nextSpeaker === 'A' ? barsA : barsB;
+
+          const factBar = myBars.find(b => b.isFactBar);
+          const factValue = factBar ? factBar.value : 50;
+          const useSearch = factValue >= 70;
+          const isNonsense = factValue <= 30;
+
+          const barDescriptions = myBars.map(b => {
+            return `- 【${b.left} (0%) ↔ ${b.right} (100%)】：目前設定為 ${b.value}%`;
+          }).join('\n');
+
+          let factInstruction = '';
+          if (useSearch) {
+            factInstruction = '【重要：本於事實模式】請務必使用 Google 搜尋查證真實數據、法規、科學事實或新聞事件來反擊對方，做到有憑有據、字字珠璣！';
+          } else if (isNonsense) {
+            factInstruction = '【重要：胡言亂語模式】請完全忽略真實邏輯與科學事實，開始瞎掰數據、亂引述名人沒說過的話、或是用荒謬滑稽的歪理強詞奪理！';
+          }
+
+          const systemPrompt = `你現在正在進行一場角色扮演對立攻防對話。
+你的角色是：「${myRole}」（立場代號 ${nextSpeaker}）。
+你的對立面角色是：「${oppRole}」。
+
+請嚴格根據以下拉桿參數（BAR）來決定你這次回嘴的語氣與態度：
+${barDescriptions}
+
+${factInstruction}
+
+規則：
+1. 直接輸出「${myRole}」回答的台詞本身，不要加上「${myRole}：」等前綴。
+2. 如果對方上一句話有附圖片，請務必針對圖片裡的內容或梗圖意境進行嘲諷、反擊或回應！
+3. 字數控制在 40～150 字左右，口語化、符合角色身分。`;
+
+          const contents = messages.map(m => {
+            const parts = [];
+            const rName = m.speaker === 'A' ? roleA : roleB;
+            parts.push({ text: `[${rName} 說]: ${m.text || '(傳送了一張圖片)'}` });
+            if (m.image) {
+              const [meta, base64Data] = m.image.split(',');
+              const mimeType = meta.match(/:(.*?);/)[1];
+              parts.push({
+                inlineData: { mimeType, data: base64Data }
+              });
+            }
+            return {
+              role: m.speaker === nextSpeaker ? 'model' : 'user',
+              parts
+            };
+          });
+
+          // 確保最後一個是 user 觸發回覆
+          if (contents.length === 0 || contents[contents.length - 1].role === 'model') {
+            contents.push({
+              role: 'user',
+              parts: [{ text: `請以「${myRole}」的身分開始發言或回擊「${oppRole}」。` }]
+            });
+          }
+
+          const payload = {
+            systemInstruction: { parts: [{ text: systemPrompt }] },
+            contents,
+            generationConfig: {
+              temperature: isNonsense ? 1.2 : (useSearch ? 0.4 : 0.85)
+            }
+          };
+
+          if (useSearch) {
+            payload.tools = [{ google_search: {} }];
+          }
+
+          const res = await fetch(
+            `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey.trim()}`,
+            {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(payload)
+            }
+          );
+
+          const data = await res.json();
+          if (!res.ok) {
+            throw new Error(data.error?.message || 'API 呼叫失敗，請檢查 API Key 是否正確');
+          }
+
+          const replyText = data.candidates?.[0]?.content?.parts?.map(p => p.text).join('') || '（無回應）';
+          const chunks = data.candidates?.[0]?.groundingMetadata?.groundingChunks || [];
+          const sources = chunks
+            .filter(c => c.web?.uri)
+            .map(c => ({ title: c.web.title || c.web.uri, uri: c.web.uri }));
+
+          setMessages(prev => [
+            ...prev,
+            {
+              id: Date.now(),
+              speaker: nextSpeaker,
+              text: replyText.trim(),
+              image: null,
+              sources
+            }
+          ]);
+        } catch (err) {
+          setErrorMsg(err.message);
+        } finally {
+          setIsGenerating(false);
+        }
+      };
+
+      const renderBarPanel = (side, roleName, setRoleName, bars) => {
+        const isA = side === 'A';
+        return (
+          <div className={`p-4 rounded-xl border ${isA ? 'bg-blue-950/40 border-blue-700/50' : 'bg-rose-950/40 border-rose-700/50'}`}>
+            <div className="flex items-center gap-2 mb-4">
+              <span className={`px-2.5 py-1 rounded-lg font-bold text-sm ${isA ? 'bg-blue-600 text-white' : 'bg-rose-600 text-white'}`}>
+                立場 {side}
+              </span>
+              <input
+                type="text"
+                value={roleName}
+                onChange={e => setRoleName(e.target.value)}
+                className="bg-slate-800 border border-slate-600 rounded-lg px-3 py-1.5 text-white font-bold flex-1 focus:outline-none focus:border-amber-400"
+                placeholder="輸入角色名稱..."
+              />
+            </div>
+
+            <div className="space-y-4">
+              {bars.map(bar => {
+                const isFactSearch = bar.isFactBar && bar.value >= 70;
+                const isFactNonsense = bar.isFactBar && bar.value <= 30;
+                return (
+                  <div key={bar.id} className="bg-slate-900/70 p-3 rounded-lg border border-slate-800">
+                    <div className="flex justify-between text-xs font-medium mb-1.5">
+                      <span className={bar.value < 50 ? 'text-amber-300 font-bold' : 'text-slate-400'}>
+                        {bar.left}
+                      </span>
+                      <span className="text-slate-400 font-mono">{bar.value}%</span>
+                      <span className={bar.value > 50 ? 'text-amber-300 font-bold' : 'text-slate-400'}>
+                        {bar.right}
+                      </span>
+                    </div>
+                    <input
+                      type="range"
+                      min="0"
+                      max="100"
+                      value={bar.value}
+                      onChange={e => handleBarChange(side, bar.id, e.target.value)}
+                      className="w-full accent-amber-500 cursor-pointer"
+                    />
+                    {bar.isFactBar && (
+                      <div className="mt-1 text-[11px] text-right">
+                        {isFactSearch && <span className="text-emerald-400 font-semibold">🌐 已啟動 Google 真實搜尋查證</span>}
+                        {isFactNonsense && <span className="text-purple-400 font-semibold">🤪 已啟動瞎掰鬼扯模式</span>}
+                        {!isFactSearch && !isFactNonsense && <span className="text-slate-500">一般常識回應</span>}
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        );
+      };
+
+      const lastSpeaker = messages.length > 0 ? messages[messages.length - 1].speaker : 'B';
+      const nextSpeaker = lastSpeaker === 'A' ? 'B' : 'A';
+      const nextRoleName = nextSpeaker === 'A' ? roleA : roleB;
+
+      return (
+        <div className="max-w-5xl mx-auto p-4 md:p-6 space-y-6">
+          {/* 頂部標題與 API Key 設定 */}
+          <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 bg-slate-800/80 p-4 rounded-xl border border-slate-700">
+            <div>
+              <h1 className="text-2xl font-extrabold bg-gradient-to-r from-blue-400 via-amber-300 to-rose-400 bg-clip-text text-transparent">
+                ⚔️ AI-TALK-SHIT 對立立場互嗆機
+              </h1>
+              <p className="text-xs text-slate-400 mt-1">
+                支援獨立語氣 BAR、真實連網查證打臉、隨時改台詞、Ctrl+V 直接貼圖回嘴
+              </p>
+            </div>
+            <div className="flex items-center gap-2">
+              <button
+                onClick={() => setShowKeyInput(!showKeyInput)}
+                className="px-3 py-1.5 text-xs font-semibold rounded-lg bg-slate-700 hover:bg-slate-600 border border-slate-500 transition"
+              >
+                🔑 {apiKey ? '已設定 API Key (點擊修改)' : '設定 Gemini API Key'}
+              </button>
+            </div>
+          </div>
+
+          {showKeyInput && (
+            <div className="bg-amber-950/40 border border-amber-600/60 p-4 rounded-xl space-y-2">
+              <label className="block text-sm font-bold text-amber-300">
+                請輸入您的 Google Gemini API Key（僅儲存於您的瀏覽器，不會外洩）：
+              </label>
+              <div className="flex gap-2">
+                <input
+                  type="password"
+                  value={apiKey}
+                  onChange={e => saveApiKey(e.target.value)}
+                  placeholder="貼上 AIzaSy 開頭的 API Key..."
+                  className="flex-1 bg-slate-900 border border-slate-600 rounded-lg px-3 py-2 text-sm text-white"
+                />
+                <button
+                  onClick={() => setShowKeyInput(false)}
+                  className="px-4 py-2 bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold rounded-lg text-sm"
+                >
+                  完成
+                </button>
+              </div>
+              <p className="text-xs text-slate-400">
+                還沒有金鑰嗎？請前往 <a href="https://aistudio.google.com/app/apikey" target="_blank" className="text-amber-400 underline">Google AI Studio</a> 免費申請一組。
+              </p>
+            </div>
+          )}
+
+          {/* 快速對立組合預設 */}
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="text-xs text-slate-400">快速帶入組合：</span>
+            {PRESET_PAIRS.map((p, idx) => (
+              <button
+                key={idx}
+                onClick={() => { setRoleA(p.a); setRoleB(p.b); }}
+                className="px-3 py-1 text-xs bg-slate-800 hover:bg-slate-700 border border-slate-600 rounded-full transition"
+              >
+                {p.a} vs {p.b}
+              </button>
+            ))}
+          </div>
+
+          {/* A 與 B 獨立控制面板 */}
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            {renderBarPanel('A', roleA, setRoleA, barsA)}
+            {renderBarPanel('B', roleB, setRoleB, barsB)}
+          </div>
+
+          {/* 新增自訂 BAR */}
+          <div className="bg-slate-800/50 p-3 rounded-xl border border-slate-700/60 flex flex-wrap items-center gap-2">
+            <span className="text-xs font-bold text-slate-300">＋ 新增自訂語氣 BAR：</span>
+            <input
+              type="text"
+              placeholder="左端點 (例：文言文)"
+              value={newBarLeft}
+              onChange={e => setNewBarLeft(e.target.value)}
+              className="bg-slate-900 border border-slate-700 rounded px-2.5 py-1 text-xs"
+            />
+            <span className="text-slate-500">↔</span>
+            <input
+              type="text"
+              placeholder="右端點 (例：鄉民酸民梗)"
+              value={newBarRight}
+              onChange={e => setNewBarRight(e.target.value)}
+              className="bg-slate-900 border border-slate-700 rounded px-2.5 py-1 text-xs"
+            />
+            <button
+              onClick={addCustomBar}
+              className="px-3 py-1 bg-slate-700 hover:bg-slate-600 text-xs font-bold rounded transition"
+            >
+              同步新增至 A & B
+            </button>
+          </div>
+
+          {/* 對話蓋樓區 */}
+          <div className="bg-slate-950 p-4 md:p-6 rounded-2xl border border-slate-800 space-y-4">
+            <div className="flex justify-between items-center border-b border-slate-800 pb-3">
+              <h2 className="font-bold text-slate-200">💬 戰場對話紀錄（點擊文字可直接修改，按 Ctrl+V 可直接貼圖）</h2>
+              <button
+                onClick={() => setMessages([])}
+                className="text-xs text-slate-400 hover:text-rose-400"
+              >
+                🗑️ 清空對話
+              </button>
+            </div>
+
+            {messages.length === 0 && (
+              <div className="text-center py-8 text-slate-500 text-sm">
+                目前沒有對話，請點擊下方按鈕開始第一句話！
+              </div>
+            )}
+
+            <div className="space-y-4">
+              {messages.map((m, index) => {
+                const isA = m.speaker === 'A';
+                const rName = isA ? roleA : roleB;
+                return (
+                  <div key={m.id} className={`flex flex-col ${isA ? 'items-start' : 'items-end'}`}>
+                    <div className="flex items-center gap-2 mb-1 px-1">
+                      <span className={`text-xs font-bold px-2 py-0.5 rounded ${isA ? 'bg-blue-600/30 text-blue-300' : 'bg-rose-600/30 text-rose-300'}`}>
+                        #{index + 1} {rName} (立場 {m.speaker})
+                      </span>
+                      <button
+                        onClick={() => deleteMessage(m.id)}
+                        className="text-[11px] text-slate-500 hover:text-rose-400"
+                        title="刪除此層"
+                      >
+                        ✕
+                      </button>
+                    </div>
+
+                    <div className={`w-full md:w-4/5 p-3 rounded-xl border ${isA ? 'bg-blue-950/30 border-blue-800/60' : 'bg-rose-950/30 border-rose-800/60'}`}>
+                      <textarea
+                        rows={3}
+                        value={m.text}
+                        onChange={e => handleMessageChange(m.id, e.target.value)}
+                        onPaste={e => handlePasteImage(e, m.id)}
+                        placeholder={`輸入 ${rName} 的台詞，或在此處按 Ctrl+V 貼上截圖/梗圖...`}
+                        className="w-full bg-transparent text-slate-100 text-sm focus:outline-none resize-y"
+                      />
+
+                      {m.image && (
+                        <div className="mt-2 relative inline-block">
+                          <img src={m.image} alt="貼上的圖片" className="max-h-56 rounded-lg border border-slate-700" />
+                          <button
+                            onClick={() => removeImage(m.id)}
+                            className="absolute top-1 right-1 bg-black/70 text-white text-xs px-2 py-0.5 rounded hover:bg-rose-600"
+                          >
+                            移除圖片
+                          </button>
+                        </div>
+                      )}
+
+                      {m.sources && m.sources.length > 0 && (
+                        <div className="mt-2 pt-2 border-t border-slate-800/80 text-xs text-emerald-400">
+                          <div className="font-bold mb-1">🔍 真實查證資料來源：</div>
+                          <ul className="list-disc list-inside space-y-0.5">
+                            {m.sources.map((s, idx) => (
+                              <li key={idx} className="truncate">
+                                <a href={s.uri} target="_blank" rel="noreferrer" className="underline hover:text-emerald-300">
+                                  {s.title}
+                                </a>
+                              </li>
+                            ))}
+                          </ul>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+
+            {errorMsg && (
+              <div className="p-3 bg-rose-950/70 border border-rose-600 text-rose-200 text-xs rounded-lg">
+                ⚠️ {errorMsg}
+              </div>
+            )}
+
+            {/* 底部操作按鈕區 */}
+            <div className="pt-4 border-t border-slate-800 flex flex-wrap items-center justify-between gap-3">
+              <div className="flex gap-2">
+                <button
+                  onClick={() => addManualMessage('A')}
+                  className="px-3 py-2 text-xs bg-blue-950 hover:bg-blue-900 border border-blue-700 rounded-lg text-blue-200"
+                >
+                  ＋ 手動新增【{roleA}】發言
+                </button>
+                <button
+                  onClick={() => addManualMessage('B')}
+                  className="px-3 py-2 text-xs bg-rose-950 hover:bg-rose-900 border border-rose-700 rounded-lg text-rose-200"
+                >
+                  ＋ 手動新增【{roleB}】發言
+                </button>
+              </div>
+
+              <button
+                onClick={() => generateNextTurn()}
+                disabled={isGenerating}
+                className="px-6 py-2.5 bg-gradient-to-r from-amber-500 to-orange-500 hover:from-amber-400 hover:to-orange-400 disabled:opacity-50 text-slate-950 font-extrabold rounded-xl shadow-lg transition flex items-center gap-2"
+              >
+                {isGenerating ? (
+                  <span>⏳ AI 正在思考並查證回嘴中...</span>
+                ) : (
+                  <span>🔥 展開下一輪（換【{nextRoleName}】自動回擊）</span>
+                )}
+              </button>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App />);
+  </script>
+</body>
+</html>
